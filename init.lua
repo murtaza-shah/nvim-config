@@ -53,6 +53,8 @@ vim.pack.add({
 	-- git gutter visualizations
 	{ src = "https://github.com/lewis6991/gitsigns.nvim" },
 
+	-- Treesitter
+	{ src = "https://github.com/nvim-treesitter/nvim-treesitter" },
 })
 
 -----------------------------------------------------------
@@ -69,6 +71,24 @@ require("gitsigns").setup({
 		changedelete = { text = "~" },
 	},
 })
+-- Treesitter
+local ok_ts, ts_configs = pcall(require, "nvim-treesitter.configs")
+if ok_ts then
+	ts_configs.setup({
+		ensure_installed = {
+			"lua",
+			"go",
+			"typescript",
+			"tsx",
+			"javascript",
+			"python",
+			"zig",
+		},
+		highlight = { enable = true },
+		indent = { enable = true },
+	})
+end
+
 
 -- mini.pick keymaps
 vim.keymap.set('n', '<leader>f', ":Pick files<CR>")
@@ -216,3 +236,54 @@ vim.keymap.set('n', '<leader>ll', function()
 	end
 	print("LSP clients: " .. table.concat(names, ", "))
 end, { desc = "List LSP clients for current buffer" })
+
+-----------------------------------------------------------
+-- LSP keymaps via LspAttach
+-----------------------------------------------------------
+local function open_qf_item_and_stay()
+  -- Simulate pressing <CR> (open item) then <C-w>p (previous window)
+  local keys = vim.api.nvim_replace_termcodes("<CR><C-w>p", true, false, true)
+  vim.api.nvim_feedkeys(keys, "n", false)
+end
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "qf" },  -- quickfix (LSP references usually open here)
+  callback = function(args)
+    vim.keymap.set("n", "<leader><CR>", open_qf_item_and_stay, {
+      buffer = args.buf,
+      noremap = true,
+      silent = true,
+      desc = "Open qf item but keep focus in quickfix window",
+    })
+  end,
+})
+
+
+
+local function lsp_keymaps(bufnr)
+  local opts = { buffer = bufnr, silent = true, noremap = true }
+
+  -- Jump / inspect
+  vim.keymap.set("n", "gd", vim.lsp.buf.definition, opts)
+  vim.keymap.set("n", "gD", vim.lsp.buf.declaration, opts)
+  vim.keymap.set("n", "gi", vim.lsp.buf.implementation, opts)
+  vim.keymap.set("n", "gr", vim.lsp.buf.references, opts)
+  vim.keymap.set("n", "K", vim.lsp.buf.hover, opts)
+
+  -- Refactor / actions
+  vim.keymap.set("n", "<leader>rn", vim.lsp.buf.rename, opts)
+  vim.keymap.set({ "n", "v" }, "<leader>ca", vim.lsp.buf.code_action, opts)
+
+  -- Diagnostics navigation
+  vim.keymap.set("n", "[d", vim.diagnostic.goto_prev, opts)
+  vim.keymap.set("n", "]d", vim.diagnostic.goto_next, opts)
+end
+
+vim.api.nvim_create_augroup("UserLspKeymaps", { clear = true })
+vim.api.nvim_create_autocmd("LspAttach", {
+  group = "UserLspKeymaps",
+  callback = function(args)
+    lsp_keymaps(args.buf)
+  end,
+})
+
