@@ -200,6 +200,9 @@ vim.keymap.set('n', '<leader>lf', function()
 	vim.lsp.buf.format({ async = true })
 end, { desc = "LSP format buffer" })
 
+-- restart lsp
+vim.keymap.set('n', '<leader>lr', ':lsp restart<CR>')
+
 -- Show which LSPs are attached to the current buffer
 vim.keymap.set('n', '<leader>ll', function()
 	local clients = vim.lsp.get_clients({ bufnr = 0 })
