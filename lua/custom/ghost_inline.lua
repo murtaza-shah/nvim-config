@@ -13,6 +13,7 @@ local state = {
   col          = nil,
   text         = nil,
   extmark      = nil,
+  dim_extmark  = nil,
   request_id   = 0,
   initializing = false,
   ready        = false,
@@ -32,10 +33,16 @@ local function clear_timer()
 end
 
 local function clear_ghost()
-  if state.bufnr and state.extmark then
-    pcall(vim.api.nvim_buf_del_extmark, state.bufnr, state.ns, state.extmark)
+  if state.bufnr then
+    if state.extmark then
+      pcall(vim.api.nvim_buf_del_extmark, state.bufnr, state.ns, state.extmark)
+    end
+    if state.dim_extmark then
+      pcall(vim.api.nvim_buf_del_extmark, state.bufnr, state.ns, state.dim_extmark)
+    end
   end
   state.extmark = nil
+  state.dim_extmark = nil
   state.text = nil
   state.bufnr = nil
   state.row = nil
@@ -43,35 +50,32 @@ local function clear_ghost()
 end
 
 local function build_completion_prompt(input)
-  local file_path = input.file_path
-  local filetype = input.filetype
-  local file_text = input.file_text
-  local cursor = input.cursor
-  
   return {
     "You are an INLINE CODE COMPLETION engine.",
+    "Your task is to predict the code that should be inserted at the cursor position.",
     "",
-    "You are given FULL contents of the current file and cursor position.",
-    "Your task:",
-    "- Predict what user is most likely to type NEXT from this cursor position.",
-    "- ONLY continue the code locally from the cursor.",
-    "- DO NOT rewrite or reformat existing lines above.",
-    "- DO NOT modify or mention other files.",
-    "- DO NOT include explanations or commentary.",
-    "- DO NOT use markdown or backticks.",
-    "- Output ONLY the raw code to insert.",
+    "CONTEXT:",
+    "File path: " .. input.file_path,
+    "Filetype: " .. input.filetype,
     "",
-    "Constraints:",
-    "- At most ~8 lines of code.",
-    "- Stay consistent with the existing style and filetype.",
+    "CODE BEFORE CURSOR (PREFIX):",
+    "<prefix>",
+    input.prefix,
+    "</prefix>",
     "",
-    "File path: " .. file_path,
-    "Filetype: " .. filetype,
-    "Cursor (0-based): row=" .. cursor.row .. ", col=" .. cursor.col,
+    "CODE AFTER CURSOR (SUFFIX):",
+    "<suffix>",
+    input.suffix,
+    "</suffix>",
     "",
-    "<file>",
-    file_text,
-    "</file>",
+    "INSTRUCTIONS:",
+    "- Predict what the user is likely to type at the cursor.",
+    "- You can replace parts of the SUFFIX if needed to maintain consistency (e.g., if you are updating a function signature and the body needs to change).",
+    "- Output ONLY the code to be inserted at the cursor position.",
+    "- If your code replaces parts of the SUFFIX, ensure it blends perfectly.",
+    "- DO NOT include explanations, commentary, or markdown.",
+    "- Output RAW code only.",
+    "- Limit your suggestion to ~15 lines.",
   }
 end
 
@@ -168,17 +172,24 @@ local function get_suggestion_async(bufnr, row, col, cb)
 
   local fullpath = vim.api.nvim_buf_get_name(bufnr)
   local filetype = vim.bo[bufnr].filetype
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local file_text = table.concat(lines, "\n")
-
-  local line = lines[row + 1] or ""
-  -- removed heuristic for empty lines to see if it helps
   
+  -- Split buffer into prefix and suffix
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local prefix_lines = vim.api.nvim_buf_get_lines(bufnr, 0, row, false)
+  local current_line = lines[row + 1] or ""
+  table.insert(prefix_lines, current_line:sub(1, col))
+  local prefix = table.concat(prefix_lines, "\n")
+  
+  local suffix_lines = { current_line:sub(col + 1) }
+  local remaining_lines = vim.api.nvim_buf_get_lines(bufnr, row + 1, -1, false)
+  for _, l in ipairs(remaining_lines) do table.insert(suffix_lines, l) end
+  local suffix = table.concat(suffix_lines, "\n")
+
   local prompt = table.concat(build_completion_prompt({
     file_path = fullpath,
     filetype = filetype,
-    file_text = file_text,
-    cursor = { row = row, col = col }
+    prefix = prefix,
+    suffix = suffix,
   }), "\n")
   
   local cmd = string.format('unset DISPLAY && unset WAYLAND_DISPLAY && unset XDG_SESSION_TYPE && unset XDG_CURRENT_DESKTOP && opencode run --model opencode/big-pickle --format json --attach %s', state.server_url)
@@ -212,21 +223,17 @@ local function get_suggestion_async(bufnr, row, col, cb)
         end
 
         if completion == "" then
-          -- Maybe it's not in JSON format or no text parts?
-          -- Check if it's just raw text (though we requested --format json)
           if raw_output ~= "" and not raw_output:match("^{") then
             completion = raw_output
           end
         end
 
-        -- For now, just trim trailing whitespace but keep newlines
         completion = completion:gsub("%s+$", "")
         if completion == "" then
           cb(nil)
           return
         end
 
-        print("Ghost debug: completion: '" .. completion:sub(1, 30):gsub("\n", "\\n") .. "...' (" .. #completion .. " chars)")
         cb(completion)
       end)
     end
@@ -240,6 +247,17 @@ local function show_ghost(bufnr, row, col, text)
   state.row = row
   state.col = col
   state.text = text
+
+  -- Dim the existing text that might be replaced
+  -- We'll dim the next 10 lines or until end of buffer
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local end_row = math.min(row + 10, line_count - 1)
+  
+  state.dim_extmark = vim.api.nvim_buf_set_extmark(bufnr, state.ns, row, col, {
+    end_row = end_row,
+    end_col = #vim.api.nvim_buf_get_lines(bufnr, end_row, end_row + 1, false)[1] or 0,
+    hl_group = "Comment", -- Dimming effect
+  })
 
   -- Strip leading newlines for display so it shows up next to cursor
   local display_text = text:gsub("^\n+", "")
