@@ -3,6 +3,7 @@ local M = {}
 M.config = {
 	idle_ms = 400,
 	accept_key = "<C-l>",
+	model = "opencode/big-pickle"
 }
 
 local state = {
@@ -17,7 +18,9 @@ local state = {
 	request_id   = 0,
 	initializing = false,
 	ready        = false,
-	server_url   = "http://127.0.0.1:4097"
+	server_url   = "http://127.0.0.1:4097",
+	server_job   = nil,
+	session_id   = nil,
 }
 
 local function set_status(s)
@@ -79,6 +82,10 @@ local function build_completion_prompt(input)
 	}
 end
 
+local function get_port()
+	return state.server_url:match(":(%d+)$") or "4097"
+end
+
 local function start_server()
 	if state.initializing or state.ready then
 		return
@@ -87,13 +94,37 @@ local function start_server()
 	state.initializing = true
 	set_status("initializing")
 
-	local port = state.server_url:match(":(%d+)$") or "4097"
-	vim.notify("OpenCode inline: starting server on port " .. port .. "…", vim.log.levels.INFO,
+	local port = get_port()
+	vim.notify("OpenCode inline: starting server on port " .. port .. "...", vim.log.levels.INFO,
 		{ title = "OpenCode" })
 
-	-- Use shell command to start server in background without --model flag
-	local cmd = string.format("opencode serve --port %s > /tmp/opencode-%s.log 2>&1 &", port, port)
-	vim.fn.system(cmd)
+	-- Use jobstart for proper process management
+	state.server_job = vim.fn.jobstart(
+		{ "opencode", "serve", "--port", port },
+		{
+			on_exit = function(_, exit_code)
+				vim.schedule(function()
+					if exit_code ~= 0 and state.ready then
+						vim.notify("OpenCode server exited unexpectedly (code " .. exit_code .. ")",
+							vim.log.levels.WARN, { title = "OpenCode" })
+					end
+					state.ready = false
+					state.server_job = nil
+					state.session_id = nil
+					set_status("off")
+				end)
+			end,
+			-- Detach stdout/stderr to avoid blocking
+			detach = true,
+		}
+	)
+
+	if state.server_job <= 0 then
+		state.initializing = false
+		set_status("error")
+		vim.notify("OpenCode: failed to start server", vim.log.levels.ERROR, { title = "OpenCode" })
+		return
+	end
 
 	local poll_count = 0
 	local max_polls = 20
@@ -108,7 +139,7 @@ local function start_server()
 				timer:close()
 				state.initializing = false
 				set_status("error")
-				vim.notify("OpenCode server: timeout. Check /tmp/opencode-" .. port .. ".log",
+				vim.notify("OpenCode server: timeout waiting for server to be ready",
 					vim.log.levels.ERROR, { title = "OpenCode" })
 				return
 			end
@@ -118,14 +149,13 @@ local function start_server()
 				{ timeout = 1000 },
 				function(obj)
 					vim.schedule(function()
-						if obj.code == 0 then
+						if obj.code == 0 and state.initializing then
 							timer:close()
 							state.initializing = false
 							state.ready = true
 							set_status("ready")
-							local browser_url = "http://localhost:" .. port
 							vim.notify(
-								"OpenCode inline: ready! Monitor at: " .. browser_url,
+								"OpenCode inline: ready! Monitor at: http://localhost:" .. port,
 								vim.log.levels.INFO,
 								{ title = "OpenCode" }
 							)
@@ -138,35 +168,14 @@ local function start_server()
 end
 
 local function stop_server()
-	if state.server_pid then
-		vim.fn.system("kill " .. state.server_pid .. " 2>/dev/null")
-		state.server_pid = nil
+	if state.server_job then
+		vim.fn.jobstop(state.server_job)
+		state.server_job = nil
 	end
-
-	vim.fn.system("pkill -f 'opencode.*--port 4097' 2>/dev/null")
 	state.ready = false
+	state.session_id = nil
 	set_status("off")
 end
-
-vim.keymap.set("n", "<leader>oi", function()
-	start_server()
-end, { desc = "Start OpenCode inline server" })
-
-vim.keymap.set("n", "<leader>os", function()
-	if state.ready then
-		local browser_url = state.server_url:gsub("http://", "https://"):gsub("127%.0%.0%.1", "localhost")
-		vim.notify("OpenCode server running! Monitor at: " .. browser_url, vim.log.levels.INFO,
-			{ title = "OpenCode" })
-	else
-		vim.notify("OpenCode server not running. Use <leader>oi to start it.", vim.log.levels.WARN,
-			{ title = "OpenCode" })
-	end
-end, { desc = "Check OpenCode server status" })
-
-vim.keymap.set("n", "<leader>ok", function()
-	stop_server()
-	vim.notify("OpenCode server stopped", vim.log.levels.INFO, { title = "OpenCode" })
-end, { desc = "Stop OpenCode inline server" })
 
 local function get_suggestion_async(bufnr, row, col, cb)
 	if not state.ready then
@@ -196,12 +205,22 @@ local function get_suggestion_async(bufnr, row, col, cb)
 		suffix = suffix,
 	}), "\n")
 
-	local cmd = string.format(
-	'unset DISPLAY && unset WAYLAND_DISPLAY && unset XDG_SESSION_TYPE && unset XDG_CURRENT_DESKTOP && opencode run --model opencode/big-pickle --format json --attach %s',
-		state.server_url)
+	-- Build command args
+	local cmd_args = {
+		"opencode", "run",
+		"--model", M.config.model,
+		"--format", "json",
+		"--attach", state.server_url,
+	}
+
+	-- Reuse session if we have one (avoids creating new conversations)
+	if state.session_id then
+		table.insert(cmd_args, "--session")
+		table.insert(cmd_args, state.session_id)
+	end
 
 	vim.system(
-		{ "sh", "-c", cmd },
+		cmd_args,
 		{
 			stdin = prompt,
 			timeout = 15000
@@ -222,8 +241,15 @@ local function get_suggestion_async(bufnr, row, col, cb)
 					local trimmed = line:match("^%s*(.-)%s*$")
 					if trimmed and trimmed ~= "" then
 						local ok, data = pcall(vim.json.decode, trimmed)
-						if ok and data.type == "text" and data.part and data.part.text then
-							completion = completion .. data.part.text
+						if ok then
+							-- Capture session ID from any event (they all include it)
+							if data.sessionID and not state.session_id then
+								state.session_id = data.sessionID
+							end
+							-- Extract text content
+							if data.type == "text" and data.part and data.part.text then
+								completion = completion .. data.part.text
+							end
 						end
 					end
 				end
@@ -379,9 +405,31 @@ function M.setup(opts)
 
 	set_status("off")
 
+	-- Accept completion keymap
 	vim.keymap.set("i", M.config.accept_key, function()
 		M.accept()
 	end, { noremap = true, silent = true, desc = "Accept ghost inline completion" })
+
+	-- Server control keymaps
+	vim.keymap.set("n", "<leader>oi", function()
+		start_server()
+	end, { desc = "Start OpenCode inline server" })
+
+	vim.keymap.set("n", "<leader>os", function()
+		if state.ready then
+			local port = get_port()
+			vim.notify("OpenCode server running! Monitor at: http://localhost:" .. port, vim.log.levels.INFO,
+				{ title = "OpenCode" })
+		else
+			vim.notify("OpenCode server not running. Use <leader>oi to start it.", vim.log.levels.WARN,
+				{ title = "OpenCode" })
+		end
+	end, { desc = "Check OpenCode server status" })
+
+	vim.keymap.set("n", "<leader>ok", function()
+		stop_server()
+		vim.notify("OpenCode server stopped", vim.log.levels.INFO, { title = "OpenCode" })
+	end, { desc = "Stop OpenCode inline server" })
 
 	vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP", "InsertCharPre" }, {
 		callback = function()
