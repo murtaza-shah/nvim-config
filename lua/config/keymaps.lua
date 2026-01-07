@@ -3,7 +3,7 @@
 -----------------------------------------------------------
 
 -- Reload current config file
-vim.keymap.set("n", "<leader>o", ":update<CR>:source<CR>")
+vim.keymap.set("n", "<leader>so", ":update<CR>:source<CR>")
 
 -- Save / quit
 vim.keymap.set("n", "<leader>w", ":write<CR>")

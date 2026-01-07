@@ -6,6 +6,7 @@ vim.pack.add({
 	{ src = "https://github.com/vague2k/vague.nvim" },
 	{ src = "https://github.com/stevearc/oil.nvim" },
 	{ src = "https://github.com/echasnovski/mini.pick" },
+	{ src = "https://github.com/folke/which-key.nvim" },
 
 	-- LSP server definitions (no direct API use)
 	{ src = "https://github.com/neovim/nvim-lspconfig" },
@@ -35,9 +36,19 @@ vim.pack.add({
 -- Basic plugin setup
 -----------------------------------------------------------
 
--- mini.pick & oil
+-- mini.pick & oil & which-key
 require("mini.pick").setup()
 require("oil").setup()
+local wk = require("which-key")
+wk.setup({
+	preset = "helix",
+})
+wk.add({
+	{ "<leader>o", group = "Opencode" },
+	{ "<leader>f", group = "Find" },
+	{ "<leader>g", group = "Git" },
+	{ "<leader>l", group = "LSP" },
+})
 
 -- gitsigns
 require("gitsigns").setup({
@@ -73,8 +84,9 @@ end
 -----------------------------------------------------------
 
 -- mini.pick keymaps
-vim.keymap.set("n", "<leader>f", ":Pick files<CR>")
-vim.keymap.set("n", "<leader>h", ":Pick help<CR>")
+vim.keymap.set("n", "<leader>ff", ":Pick files<CR>", { desc = "Find files" })
+vim.keymap.set("n", "<leader>fg", ":Pick grep_live<CR>", { desc = "Live grep" })
+vim.keymap.set("n", "<leader>fh", ":Pick help<CR>", { desc = "Find help" })
 vim.keymap.set("n", "<leader>e", ":Oil<CR>")
 
 -- gitsigns keymaps
