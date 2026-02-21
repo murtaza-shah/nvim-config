@@ -3,7 +3,39 @@ local M = {}
 M.config = {
 	idle_ms = 400,
 	accept_key = "<C-l>",
-	model = "opencode/big-pickle"
+	model = "opencode/kimi-k2.5",
+	repo_context = {
+		enabled = true,
+		prime_on_start = true,
+		prime_on_session_reset = true,
+		max_files = 200,
+		max_bytes = 200000,
+		max_file_bytes = 8000,
+		max_signatures_per_file = 20,
+		timeout_ms = 30000,
+		include = {
+			"lua",
+			"py",
+			"js",
+			"jsx",
+			"ts",
+			"tsx",
+			"json",
+			"toml",
+			"yaml",
+			"yml",
+			"md",
+		},
+		exclude = {
+			".git",
+			"node_modules",
+			"dist",
+			"build",
+			"vendor",
+			".next",
+			".cache",
+		},
+	},
 }
 
 local state = {
@@ -21,6 +53,15 @@ local state = {
 	server_url   = "http://127.0.0.1:4097",
 	server_job   = nil,
 	session_id   = nil,
+	-- Track active vim.system processes for cleanup
+	active_jobs  = {}, -- table of { [request_id] = SystemObj }
+	-- Repo context priming state
+	repo_context = {
+		primed = false,
+		priming = false,
+		root = nil,
+		text = nil,
+	},
 	-- Review mode state
 	review       = {
 		active = false,
@@ -30,6 +71,8 @@ local state = {
 		extmarks = {}, -- Extmarks for current preview
 	},
 }
+
+local prime_repo_context
 
 local function set_status(s)
 	vim.g.ghost_inline_status = s
@@ -43,7 +86,28 @@ local function clear_timer()
 	end
 end
 
+-- Kill all active completion jobs (called when requests become stale)
+local function kill_active_jobs()
+	for id, job in pairs(state.active_jobs) do
+		pcall(function() job:kill("SIGTERM") end)
+		state.active_jobs[id] = nil
+	end
+end
+
+-- Kill jobs older than the current request_id
+local function kill_stale_jobs(current_id)
+	for id, job in pairs(state.active_jobs) do
+		if id < current_id then
+			pcall(function() job:kill("SIGTERM") end)
+			state.active_jobs[id] = nil
+		end
+	end
+end
+
 local function clear_ghost()
+	-- Kill any pending completion jobs since we're clearing the ghost
+	kill_active_jobs()
+
 	if state.bufnr then
 		if state.extmark then
 			pcall(vim.api.nvim_buf_del_extmark, state.bufnr, state.ns, state.extmark)
@@ -120,6 +184,8 @@ local function start_server()
 					state.ready = false
 					state.server_job = nil
 					state.session_id = nil
+					state.repo_context.primed = false
+					state.repo_context.priming = false
 					set_status("off")
 				end)
 			end,
@@ -169,6 +235,13 @@ local function start_server()
 								vim.log.levels.INFO,
 								{ title = "OpenCode" }
 							)
+							if M.config.repo_context.enabled and M.config.repo_context.prime_on_start then
+								vim.defer_fn(function()
+									if state.ready then
+										prime_repo_context()
+									end
+								end, 10)
+							end
 						end
 					end)
 				end
@@ -178,17 +251,24 @@ local function start_server()
 end
 
 local function stop_server()
+	-- Kill all active completion jobs first
+	kill_active_jobs()
+
 	if state.server_job then
 		vim.fn.jobstop(state.server_job)
 		state.server_job = nil
 	end
 	state.ready = false
 	state.session_id = nil
+	state.repo_context.primed = false
+	state.repo_context.priming = false
 	set_status("off")
 end
 
 local function reset_session()
 	state.session_id = nil
+	state.repo_context.primed = false
+	state.repo_context.priming = false
 	set_status("ready (new session)")
 	vim.notify("OpenCode: session reset. Next completion will start a new conversation.",
 		vim.log.levels.INFO, { title = "OpenCode" })
@@ -198,6 +278,334 @@ local function reset_session()
 			set_status("ready")
 		end
 	end, 2000)
+	if M.config.repo_context.enabled and M.config.repo_context.prime_on_session_reset then
+		vim.defer_fn(function()
+			if state.ready then
+				prime_repo_context({ force = true })
+			end
+		end, 10)
+	end
+end
+
+-- ============================================================================
+-- Repo Context Priming
+-- ============================================================================
+
+local function find_repo_root()
+	local markers = { ".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod" }
+	local start = vim.api.nvim_buf_get_name(0)
+	if start == "" then
+		start = vim.fn.getcwd()
+	end
+	if vim.fs and vim.fs.root then
+		local root = vim.fs.root(start, markers)
+		if root and root ~= "" then
+			return root
+		end
+	end
+	return vim.fn.getcwd()
+end
+
+local function is_excluded(name, exclude)
+	for _, item in ipairs(exclude or {}) do
+		if name == item then
+			return true
+		end
+	end
+	return false
+end
+
+local function is_included(name, include)
+	if not include or #include == 0 then
+		return true
+	end
+	local ext = name:match("%.([%w_]+)$")
+	if not ext then
+		return false
+	end
+	ext = ext:lower()
+	for _, item in ipairs(include) do
+		if ext == item then
+			return true
+		end
+	end
+	return false
+end
+
+local function to_relative_path(root, path)
+	if path:sub(1, #root) == root then
+		local rel = path:sub(#root + 2)
+		if rel ~= "" then
+			return rel
+		end
+	end
+	return path
+end
+
+local function scan_repo_files(root, cfg)
+	local files = {}
+	local stack = { root }
+
+	while #stack > 0 do
+		local dir = table.remove(stack)
+		local fs = vim.loop.fs_scandir(dir)
+		if fs then
+			while true do
+				local name, t = vim.loop.fs_scandir_next(fs)
+				if not name then
+					break
+				end
+				if not is_excluded(name, cfg.exclude) then
+					local full = dir .. "/" .. name
+					if t == "directory" then
+						table.insert(stack, full)
+					elseif t == "file" and is_included(name, cfg.include) then
+						table.insert(files, full)
+						if #files >= cfg.max_files then
+							return files
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return files
+end
+
+local function read_file_limited(path, max_bytes)
+	local fd = vim.loop.fs_open(path, "r", 438)
+	if not fd then
+		return nil
+	end
+	local stat = vim.loop.fs_fstat(fd)
+	if not stat or not stat.size then
+		vim.loop.fs_close(fd)
+		return nil
+	end
+	local size = math.min(stat.size, max_bytes)
+	local data = vim.loop.fs_read(fd, size, 0)
+	vim.loop.fs_close(fd)
+	if not data or data == "" then
+		return nil
+	end
+	if data:find("\0", 1, true) then
+		return nil
+	end
+	return data
+end
+
+local function extract_signatures(path, content, cfg)
+	local filetype = ""
+	if vim.filetype and vim.filetype.match then
+		filetype = vim.filetype.match({ filename = path }) or ""
+	end
+
+	local lines = vim.split(content, "\n", { plain = true })
+	local out = {}
+
+	local function add(line)
+		if not line or line == "" then
+			return
+		end
+		line = line:gsub("%s+$", "")
+		table.insert(out, line)
+	end
+
+	for _, line in ipairs(lines) do
+		if #out >= cfg.max_signatures_per_file then
+			break
+		end
+
+		if filetype == "lua" then
+			if line:match("^%s*function%s+[%w_%.:]+") then
+				add(line)
+			elseif line:match("^%s*[%w_%.]+%s*=%s*function") then
+				add(line)
+			end
+		elseif filetype == "python" then
+			if line:match("^%s*def%s+[%w_]+%s*%(")
+				or line:match("^%s*class%s+[%w_]+")
+				or line:match("^%s*__all__%s*=") then
+				add(line)
+			end
+		elseif filetype == "javascript" or filetype == "typescript"
+			or filetype == "javascriptreact" or filetype == "typescriptreact" then
+			if line:match("^%s*export%s+")
+				or line:match("^%s*module%.exports")
+				or line:match("^%s*function%s+[%w_]+")
+				or line:match("^%s*const%s+[%w_]+%s*=") then
+				add(line)
+			end
+		elseif filetype == "go" then
+			if line:match("^%s*func%s+[%w_]+")
+				or line:match("^%s*type%s+[%w_]+")
+				or line:match("^%s*var%s+[%w_]+")
+				or line:match("^%s*const%s+[%w_]+") then
+				add(line)
+			end
+		elseif filetype == "rust" then
+			if line:match("^%s*pub%s+fn%s+[%w_]+")
+				or line:match("^%s*fn%s+[%w_]+")
+				or line:match("^%s*pub%s+struct%s+[%w_]+")
+				or line:match("^%s*struct%s+[%w_]+") then
+				add(line)
+			end
+		else
+			if line:match("^%s*class%s+[%w_]+")
+				or line:match("^%s*def%s+[%w_]+")
+				or line:match("^%s*function%s+[%w_]+")
+				or line:match("^%s*export%s+") then
+				add(line)
+			end
+		end
+	end
+
+	return out
+end
+
+local function build_repo_context_text(root, files, cfg)
+	local lines = {}
+	local bytes = 0
+
+	local function add(line)
+		local needed = #line + 1
+		if bytes + needed > cfg.max_bytes then
+			return false
+		end
+		table.insert(lines, line)
+		bytes = bytes + needed
+		return true
+	end
+
+	add("REPO ROOT: " .. root)
+	add("FILES:")
+	for _, path in ipairs(files) do
+		local rel = to_relative_path(root, path)
+		if not add("- " .. rel) then
+			return table.concat(lines, "\n")
+		end
+	end
+	add("")
+	add("SYMBOLS:")
+
+	for _, path in ipairs(files) do
+		if bytes >= cfg.max_bytes then
+			break
+		end
+		local data = read_file_limited(path, cfg.max_file_bytes)
+		if data then
+			local sigs = extract_signatures(path, data, cfg)
+			if #sigs > 0 then
+				local rel = to_relative_path(root, path)
+				if not add(rel .. ":") then
+					break
+				end
+				for _, sig in ipairs(sigs) do
+					if not add("  " .. sig) then
+						break
+					end
+				end
+			end
+		end
+	end
+
+	return table.concat(lines, "\n")
+end
+
+prime_repo_context = function(opts)
+	opts = opts or {}
+	local cfg = M.config.repo_context or {}
+	if not cfg.enabled then
+		return
+	end
+	if state.repo_context.priming then
+		return
+	end
+	if state.repo_context.primed and not opts.force then
+		return
+	end
+	if not state.ready then
+		vim.notify("OpenCode server not ready. Use <leader>oi to start it.", vim.log.levels.WARN,
+			{ title = "OpenCode" })
+		return
+	end
+
+	local root = find_repo_root()
+	local files = scan_repo_files(root, cfg)
+	if #files == 0 then
+		return
+	end
+
+	local context = build_repo_context_text(root, files, cfg)
+	if not context or context == "" then
+		return
+	end
+
+	state.repo_context.root = root
+	state.repo_context.text = context
+	state.repo_context.priming = true
+	state.repo_context.primed = false
+	set_status("priming repo context...")
+
+	local prompt = table.concat({
+		"You are a code assistant.",
+		"Learn the following repository context for future completions and edits.",
+		"Respond ONLY with OK.",
+		"",
+		"REPO CONTEXT:",
+		context,
+	}, "\n")
+
+	local cmd_args = {
+		"opencode", "run",
+		"--model", M.config.model,
+		"--format", "json",
+		"--attach", state.server_url,
+	}
+
+	if state.session_id then
+		table.insert(cmd_args, "--session")
+		table.insert(cmd_args, state.session_id)
+	end
+
+	vim.system(
+		cmd_args,
+		{
+			stdin = prompt,
+			timeout = cfg.timeout_ms or 30000,
+		},
+		function(obj)
+			vim.schedule(function()
+				state.repo_context.priming = false
+				set_status(state.ready and "ready" or "off")
+
+				if obj.code ~= 0 then
+					state.repo_context.primed = false
+					vim.notify("OpenCode: repo context priming failed", vim.log.levels.WARN,
+						{ title = "OpenCode" })
+					return
+				end
+
+				local raw_output = obj.stdout or ""
+				for line in raw_output:gmatch("[^\r\n]+") do
+					local trimmed = line:match("^%s*(.-)%s*$")
+					if trimmed and trimmed ~= "" then
+						local ok, data = pcall(vim.json.decode, trimmed)
+						if ok then
+							if data.sessionID and not state.session_id then
+								state.session_id = data.sessionID
+							end
+						end
+					end
+				end
+
+				state.repo_context.primed = true
+				vim.notify("OpenCode: repo context primed", vim.log.levels.INFO,
+					{ title = "OpenCode" })
+			end)
+		end
+	)
 end
 
 -- ============================================================================
@@ -756,7 +1164,13 @@ local function get_suggestion_async(bufnr, row, col, cb)
 		table.insert(cmd_args, state.session_id)
 	end
 
-	vim.system(
+	-- Track the request_id for this specific call
+	local this_request_id = state.request_id
+
+	-- Kill any stale jobs before starting a new one
+	kill_stale_jobs(this_request_id)
+
+	local job = vim.system(
 		cmd_args,
 		{
 			stdin = prompt,
@@ -764,9 +1178,20 @@ local function get_suggestion_async(bufnr, row, col, cb)
 		},
 		function(obj)
 			vim.schedule(function()
+				-- Remove from active jobs tracking
+				state.active_jobs[this_request_id] = nil
+
+				-- If this request is stale, don't process the result
+				if this_request_id ~= state.request_id then
+					return
+				end
+
 				if obj.code ~= 0 then
-					if obj.stderr and obj.stderr ~= "" then
-						print("OpenCode error (exit " .. obj.code .. "): " .. obj.stderr)
+					-- Don't log errors for killed processes (SIGTERM = -15 or signal 9)
+					if obj.signal ~= 15 and obj.signal ~= 9 then
+						if obj.stderr and obj.stderr ~= "" then
+							print("OpenCode error (exit " .. obj.code .. "): " .. obj.stderr)
+						end
 					end
 					cb(nil)
 					return
@@ -807,6 +1232,9 @@ local function get_suggestion_async(bufnr, row, col, cb)
 			end)
 		end
 	)
+
+	-- Track this job for potential cleanup
+	state.active_jobs[this_request_id] = job
 end
 
 local function show_ghost(bufnr, row, col, text)
@@ -938,7 +1366,15 @@ local function schedule_suggestion()
 end
 
 function M.setup(opts)
-	M.config = vim.tbl_extend("force", M.config, opts or {})
+	local cfg = opts or {}
+	if type(cfg.repo_context) == "table" then
+		M.config.repo_context = vim.tbl_extend("force", M.config.repo_context, cfg.repo_context)
+		cfg.repo_context = nil
+	elseif cfg.repo_context == false then
+		M.config.repo_context.enabled = false
+		cfg.repo_context = nil
+	end
+	M.config = vim.tbl_extend("force", M.config, cfg)
 
 	set_status("off")
 
@@ -971,6 +1407,10 @@ function M.setup(opts)
 	vim.keymap.set("n", "<leader>or", function()
 		reset_session()
 	end, { desc = "Reset OpenCode session (start fresh conversation)" })
+
+	vim.keymap.set("n", "<leader>oc", function()
+		prime_repo_context({ force = true })
+	end, { desc = "Prime OpenCode repo context" })
 
 	vim.keymap.set("n", "<leader>om", function()
 		prompt_and_edit()
