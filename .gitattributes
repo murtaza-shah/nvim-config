@@ -1,0 +1,3 @@
+# Force LF line endings everywhere — neovim config should be consistent
+# regardless of host OS (Windows, macOS, Linux)
+* text=auto eol=lf

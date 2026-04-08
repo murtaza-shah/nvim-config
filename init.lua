@@ -5,6 +5,8 @@ require("config.keymaps")  -- global (non-plugin) keymaps
 require("config.plugins")  -- plugin definitions & setup
 require("config.lsp")      -- mason, cmp, lsp config & keymaps
 
+require("custom.pi_chat").setup()
+
 -- require("custom.ghost_inline").setup({
 -- 		idle_ms = 1200,
 -- 		accept_key = "<C-l>",

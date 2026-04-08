@@ -44,6 +44,7 @@ wk.setup({
 	preset = "helix",
 })
 wk.add({
+	{ "<leader>a", group = "AI Agent" },
 	{ "<leader>o", group = "Opencode" },
 	{ "<leader>f", group = "Find" },
 	{ "<leader>g", group = "Git" },
