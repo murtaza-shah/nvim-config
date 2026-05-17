@@ -91,6 +91,12 @@ vim.lsp.config("lua_ls", {
 	},
 })
 
+vim.lsp.config('ocamllsp', {
+	cmd = { "opam", "exec", "--", "ocamllsp" }
+})
+
+vim.lsp.enable('ocamllsp', { 'ocaml', 'ocaml.interface', 'reason' })
+
 -- Function to enable all LSPs that Mason has installed
 local function enable_installed_lsps()
 	local servers = mason_lspconfig.get_installed_servers()
