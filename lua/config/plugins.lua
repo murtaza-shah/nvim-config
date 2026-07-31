@@ -1,12 +1,35 @@
 -----------------------------------------------------------
 -- Plugin management (built-in vim.pack)
 -----------------------------------------------------------
+
+-- fff.nvim: download/build its Rust binary on install & update.
+-- Registered before vim.pack.add so the initial install event is caught.
+vim.api.nvim_create_autocmd("PackChanged", {
+	callback = function(ev)
+		local name, kind = ev.data.spec.name, ev.data.kind
+		if name == "fff.nvim" and (kind == "install" or kind == "update") then
+			if not ev.data.active then
+				vim.cmd.packadd("fff.nvim")
+			end
+			require("fff.download").download_or_build_binary()
+		end
+	end,
+})
+
+-- fff.nvim config (read by the plugin on init)
+vim.g.fff = {
+	lazy_sync = true,
+}
+
 vim.pack.add({
 	-- UI / theme / basic tools
 	{ src = "https://github.com/vague2k/vague.nvim" },
 	{ src = "https://github.com/stevearc/oil.nvim" },
 	{ src = "https://github.com/echasnovski/mini.pick" },
 	{ src = "https://github.com/folke/which-key.nvim" },
+
+	-- Fast typo-resistant file search & grep (Rust core, frecency ranked)
+	{ src = "https://github.com/dmtrKovalenko/fff", name = "fff.nvim" },
 
 	-- LSP server definitions (no direct API use)
 	{ src = "https://github.com/neovim/nvim-lspconfig" },
@@ -84,9 +107,13 @@ end
 -- Plugin-specific keymaps
 -----------------------------------------------------------
 
--- mini.pick keymaps
-vim.keymap.set("n", "<leader>ff", ":Pick files<CR>", { desc = "Find files" })
-vim.keymap.set("n", "<leader>fg", ":Pick grep_live<CR>", { desc = "Live grep" })
+-- fff.nvim keymaps (file search & grep)
+vim.keymap.set("n", "<leader>ff", function() require("fff").find_files() end, { desc = "Find files" })
+vim.keymap.set("n", "<leader>fg", function() require("fff").live_grep() end, { desc = "Live grep" })
+vim.keymap.set("n", "<leader>fz", function() require("fff").live_grep({ grep = { modes = { "fuzzy", "plain" } } }) end, { desc = "Fuzzy grep" })
+vim.keymap.set({ "n", "x" }, "<leader>fw", function() require("fff").live_grep_under_cursor() end, { desc = "Grep word/selection" })
+
+-- mini.pick keymaps (help tags stay on mini.pick, fff doesn't index them)
 vim.keymap.set("n", "<leader>fh", ":Pick help<CR>", { desc = "Find help" })
 vim.keymap.set("n", "<leader>e", ":Oil<CR>")
 
