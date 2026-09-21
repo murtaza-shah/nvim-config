@@ -13,6 +13,10 @@ vim.keymap.set("n", "<leader>q", ":quit<CR>")
 vim.keymap.set("v", "<leader>y", '"+y')
 vim.keymap.set("v", "<leader>p", '"+P"')
 
+-- Split buffer
+vim.keymap.set("n", "<leader>sv", ":vs<CR>")
+vim.keymap.set("n", "<leader>sh", ":sp<CR>")
+
 -- Buffer navigation
 vim.keymap.set("n", "<leader>bb", "<C-^>")
 vim.keymap.set("n", "<leader>be", function()
